@@ -212,15 +212,24 @@ rm(fread_df)
 invisible(gc())
 mem_report("after rm(fread_df); gc()")
 
+# Old vroom_df objects (and their decompressed temp files) otherwise pile up
+# until GC, which rarely runs here; time the forced GC so its cost is known.
+vroom_gc_elapsed <- 0
 benchmark("Sample 5000 rows from each of 14 CRAN logs with vroom", system.time({
   for (file in sort(dir(target("cranlogs"), full.names = TRUE))) {
     vroom_df <- vroom(file, progress = FALSE, col_types = "Dtdccccccd",
       col_names = c("date","time","size","r_version","r_arch","r_os","package","version","country","ip_id")
     )
     sample(vroom_df$country, 5000)
-    mem_report(basename(file))
+    gc_elapsed <- system.time({
+      rm(vroom_df)
+      invisible(gc())
+    })[["elapsed"]]
+    vroom_gc_elapsed <- vroom_gc_elapsed + gc_elapsed
+    mem_report(sprintf("%s  gc=%.3fs", basename(file), gc_elapsed))
   }
 }))
+message(sprintf("Total forced gc time in vroom task: %.3fs", vroom_gc_elapsed))
 # ===============================================================================================================
 
 benchmark_end()
