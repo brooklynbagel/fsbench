@@ -106,6 +106,27 @@ write_static_csv <- function(path, num_files, num_iter) {
   data.table::fwrite(sub_df, file = path, row.names = FALSE, col.names = FALSE)
 }
 
+# Cheap memory snapshot (Linux only): reads /proc, avoids gc() so it doesn't
+# perturb timings. VmHWM is the process's peak RSS so far; tmp is the size of
+# R's tempdir(), which counts against RAM when /tmp is a tmpfs.
+mem_report <- function(label) {
+  if (!file.exists("/proc/self/status")) {
+    message(label)
+    return(invisible())
+  }
+  kb <- function(lines, key) {
+    as.numeric(sub("^\\S+:\\s+(\\d+).*", "\\1", grep(paste0("^", key, ":"), lines, value = TRUE)))
+  }
+  status <- readLines("/proc/self/status")
+  meminfo <- readLines("/proc/meminfo")
+  tmp_bytes <- sum(file.size(list.files(tempdir(), full.names = TRUE)), na.rm = TRUE)
+  message(sprintf(
+    "%s  rss=%.0fMB peak_rss=%.0fMB tmp=%.0fMB sys_avail=%.0fMB",
+    label, kb(status, "VmRSS") / 1024, kb(status, "VmHWM") / 1024,
+    tmp_bytes / 1024^2, kb(meminfo, "MemAvailable") / 1024
+  ))
+}
+
 dump_cache <- function() {
   if (Sys.info()["sysname"] %in% c("Darwin", "Linux")) {
     system("/usr/local/sbin/purge-disk-cache")
