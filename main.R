@@ -213,23 +213,30 @@ invisible(gc())
 mem_report("after rm(fread_df); gc()")
 
 # Old vroom_df objects (and their decompressed temp files) otherwise pile up
-# until GC, which rarely runs here; time the forced GC so its cost is known.
+# until GC, which rarely runs here. Time each file separately and sum, so the
+# forced gc (CPU/memory work, not filesystem) stays outside the measurement.
+# benchmark() evaluates the block lazily, so dump_cache() still runs first.
 vroom_gc_elapsed <- 0
-benchmark("Sample 5000 rows from each of 14 CRAN logs with vroom", system.time({
+benchmark("Sample 5000 rows from each of 14 CRAN logs with vroom", {
+  vroom_time <- NULL
   for (file in sort(dir(target("cranlogs"), full.names = TRUE))) {
-    vroom_df <- vroom(file, progress = FALSE, col_types = "Dtdccccccd",
-      col_names = c("date","time","size","r_version","r_arch","r_os","package","version","country","ip_id")
-    )
-    sample(vroom_df$country, 5000)
+    file_time <- system.time({
+      vroom_df <- vroom(file, progress = FALSE, col_types = "Dtdccccccd",
+        col_names = c("date","time","size","r_version","r_arch","r_os","package","version","country","ip_id")
+      )
+      sample(vroom_df$country, 5000)
+    })
+    vroom_time <- if (is.null(vroom_time)) file_time else vroom_time + file_time
     gc_elapsed <- system.time({
       rm(vroom_df)
       invisible(gc())
     })[["elapsed"]]
     vroom_gc_elapsed <- vroom_gc_elapsed + gc_elapsed
-    mem_report(sprintf("%s  gc=%.3fs", basename(file), gc_elapsed))
+    mem_report(sprintf("%s  gc=%.3fs (untimed)", basename(file), gc_elapsed))
   }
-}))
-message(sprintf("Total forced gc time in vroom task: %.3fs", vroom_gc_elapsed))
+  vroom_time
+})
+message(sprintf("Total forced gc time in vroom task (excluded from result): %.3fs", vroom_gc_elapsed))
 # ===============================================================================================================
 
 benchmark_end()
