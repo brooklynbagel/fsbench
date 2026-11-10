@@ -107,7 +107,13 @@ write_static_csv <- function(path, num_files, num_iter) {
 }
 
 dump_cache <- function() {
-  if (Sys.info()["sysname"] %in% c("Darwin", "Linux")) {
+  if (!file.exists("/usr/local/sbin/purge-disk-cache")) {
+    # e.g. unprivileged Kubernetes pods, where `make setup` can't install it
+    if (!isTRUE(getOption("fsbench.purge_warned"))) {
+      warning("purge-disk-cache not installed; disk cache is not cleared, benchmark results may be optimistic!")
+      options(fsbench.purge_warned = TRUE)
+    }
+  } else if (Sys.info()["sysname"] %in% c("Darwin", "Linux")) {
     system("/usr/local/sbin/purge-disk-cache")
   } else {
     warning("Clearing disk cache is not possible on this platform, benchmark results are unreliable!")
