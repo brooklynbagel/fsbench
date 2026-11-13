@@ -22,8 +22,10 @@ benchmark <- function(name, task, parallelism = NA) {
 # Task: ", name, "
 # ================================================
 ")
-  dump_cache()
+  purge_time <- system.time(dump_cache())[["elapsed"]]
+  stats_before <- mountstats_snapshot()
   force(task)
+  mountstats_record(name, stats_before, purge_time)
   if (!inherits(task, "proc_time")) {
     warning("Task '", name, "' returned wrong object type. Expected 'proc_time', got '", class(task)[1], "'")
   } else {
@@ -32,7 +34,8 @@ benchmark <- function(name, task, parallelism = NA) {
 }
 
 aggregate_benchmark <- function(name, iterations, task) {
-  dump_cache()
+  purge_time <- system.time(dump_cache())[["elapsed"]]
+  stats_before <- mountstats_snapshot()
 
   # perform the timer on the entire set of iterations instead of timing each
   # iteration individually - we need to do this because the overhead of using
@@ -45,6 +48,7 @@ aggregate_benchmark <- function(name, iterations, task) {
     }
   })
 
+  mountstats_record(name, stats_before, purge_time)
   times[[name]] <<- list(time=aggregate_time, parallelism=NA)
 }
 
@@ -106,16 +110,134 @@ write_static_csv <- function(path, num_files, num_iter) {
   data.table::fwrite(sub_df, file = path, row.names = FALSE, col.names = FALSE)
 }
 
-dump_cache <- function() {
-  if (!file.exists("/usr/local/sbin/purge-disk-cache")) {
-    # e.g. unprivileged Kubernetes pods, where `make setup` can't install it
-    if (!isTRUE(getOption("fsbench.purge_warned"))) {
-      warning("purge-disk-cache not installed; disk cache is not cleared, benchmark results may be optimistic!")
-      options(fsbench.purge_warned = TRUE)
-    }
-  } else if (Sys.info()["sysname"] %in% c("Darwin", "Linux")) {
-    system("/usr/local/sbin/purge-disk-cache")
-  } else {
-    warning("Clearing disk cache is not possible on this platform, benchmark results are unreliable!")
+warn_once <- function(key, ...) {
+  key <- paste0("fsbench.warned.", key)
+  if (!isTRUE(getOption(key))) {
+    warning(..., call. = FALSE)
+    options(structure(list(TRUE), names = key))
   }
+}
+
+evict_bin <- function() {
+  candidates <- c(
+    Sys.getenv("FSBENCH_EVICT_BIN"),
+    Sys.which("evict-disk-cache"),
+    "/usr/local/bin/evict-disk-cache",
+    file.path("tools", "evict-disk-cache")
+  )
+  candidates <- candidates[nzchar(candidates) & file.exists(candidates)]
+  if (length(candidates)) candidates[[1]] else ""
+}
+
+# FSBENCH_PURGE selects how the cache is cleared before each task:
+# - "auto" (default): purge-disk-cache (drop_caches); if it's missing or fails
+#   (e.g. unprivileged Kubernetes pods/Workbench sessions), fall back to
+#   evict-disk-cache, a pod-scoped approximation (tools/evict-disk-cache.c).
+# - "drop" / "evict": only that method; error if it's unavailable or fails.
+# - "none": don't clear anything (for comparisons).
+# FSBENCH_EVICT_ARGS passes extra flags to evict-disk-cache (e.g. "-n -D").
+dump_cache <- function() {
+  mode <- Sys.getenv("FSBENCH_PURGE", "auto")
+  mode <- match.arg(mode, c("auto", "drop", "evict", "none"))
+  sysname <- Sys.info()[["sysname"]]
+  if (mode == "none") {
+    warn_once("none", "FSBENCH_PURGE=none; disk cache is not cleared")
+    return(invisible())
+  }
+  if (!sysname %in% c("Darwin", "Linux")) {
+    warning("Clearing disk cache is not possible on this platform, benchmark results are unreliable!")
+    return(invisible())
+  }
+
+  purge_bin <- "/usr/local/sbin/purge-disk-cache"
+  if (mode == "drop" || (mode == "auto" && !isTRUE(getOption("fsbench.drop_failed")))) {
+    if (file.exists(purge_bin)) {
+      status <- system(purge_bin)
+      if (status == 0) return(invisible())
+      if (mode == "drop") stop("purge-disk-cache failed with exit status ", status)
+      # Remember the failure so later tasks don't retry it every time
+      options(fsbench.drop_failed = TRUE)
+      message("purge-disk-cache failed (exit status ", status, "); trying evict-disk-cache")
+    } else if (mode == "drop") {
+      stop("FSBENCH_PURGE=drop but ", purge_bin, " is not installed")
+    }
+  }
+
+  bin <- if (sysname == "Linux") evict_bin() else ""
+  if (nzchar(bin)) {
+    if (mode == "auto") {
+      warn_once("evict", "Using evict-disk-cache: per-file/pod-scoped cache eviction, an approximation of a full disk-cache purge")
+    }
+    args <- strsplit(trimws(Sys.getenv("FSBENCH_EVICT_ARGS")), "\\s+")[[1]]
+    status <- system2(bin, c(args, shQuote(target_dir)))
+    if (status != 0) {
+      if (mode == "evict") stop("evict-disk-cache failed with exit status ", status)
+      warning("evict-disk-cache failed with exit status ", status)
+    }
+    return(invisible())
+  }
+
+  if (mode == "evict") stop("FSBENCH_PURGE=evict but evict-disk-cache was not found")
+  warn_once("purge", "No working purge-disk-cache or evict-disk-cache; disk cache is not cleared, benchmark results may be optimistic!")
+}
+
+# NFS client counters ==========================================================
+# If FSBENCH_MOUNTSTATS_FILE is set, append per-task deltas of the NFS
+# per-op counts and byte counters for TARGET_DIR's mount (from
+# /proc/self/mountstats) to that CSV. Counters are per NFS superblock, so they
+# include other pods on the node that mount the same volume.
+
+mountstats_mount <- function(lines, path) {
+  dev <- grep("^device ", lines)
+  mp <- sub("^device .* mounted on (\\S+) with fstype (\\S+).*$", "\\1", lines[dev])
+  fs <- sub("^device .* mounted on (\\S+) with fstype (\\S+).*$", "\\2", lines[dev])
+  ok <- startsWith(fs, "nfs") &
+    (path == mp | startsWith(path, paste0(sub("/$", "", mp), "/")))
+  if (!any(ok)) return(NULL)
+  k <- which(ok)[which.max(nchar(mp[ok]))]
+  end <- if (k < length(dev)) dev[k + 1] - 1 else length(lines)
+  lines[(dev[k] + 1):end]
+}
+
+mountstats_snapshot <- function() {
+  if (!nzchar(Sys.getenv("FSBENCH_MOUNTSTATS_FILE")) ||
+      !file.exists("/proc/self/mountstats")) {
+    return(NULL)
+  }
+  path <- normalizePath(target_dir, mustWork = FALSE)
+  block <- mountstats_mount(readLines("/proc/self/mountstats"), path)
+  if (is.null(block)) {
+    warn_once("mountstats", "FSBENCH_MOUNTSTATS_FILE set but ", path, " is not on an NFS mount")
+    return(NULL)
+  }
+  bytes_line <- grep("^\\s*bytes:", block, value = TRUE)[1]
+  bytes <- as.numeric(strsplit(trimws(sub("^\\s*bytes:", "", bytes_line)), "\\s+")[[1]])
+  bytes <- stats::setNames(bytes[1:6], c(
+    "bytes_normal_read", "bytes_normal_write", "bytes_direct_read",
+    "bytes_direct_write", "bytes_server_read", "bytes_server_write"
+  ))
+  ops_start <- grep("per-op statistics", block)
+  ops <- block[seq_along(block) > ops_start]
+  ops <- regmatches(ops, regexec("^\\s+([A-Z_0-9]+):\\s+(\\d+)", ops))
+  ops <- Filter(length, ops)
+  ops <- stats::setNames(
+    vapply(ops, function(m) as.numeric(m[[3]]), numeric(1)),
+    paste0("ops_", vapply(ops, `[[`, character(1), 2))
+  )
+  c(bytes, ops)
+}
+
+mountstats_record <- function(name, before, purge_time) {
+  if (is.null(before)) return(invisible())
+  after <- mountstats_snapshot()
+  delta <- after[names(before)] - before
+  delta <- delta[!is.na(delta) & delta != 0]
+  out <- data.frame(
+    task = name,
+    metric = c("purge_elapsed", names(delta)),
+    value = c(purge_time, unname(delta))
+  )
+  file <- Sys.getenv("FSBENCH_MOUNTSTATS_FILE")
+  utils::write.table(out, file, sep = ",", row.names = FALSE,
+    col.names = !file.exists(file), append = file.exists(file))
 }
