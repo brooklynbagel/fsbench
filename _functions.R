@@ -224,7 +224,33 @@ mountstats_snapshot <- function() {
     vapply(ops, function(m) as.numeric(m[[3]]), numeric(1)),
     paste0("ops_", vapply(ops, `[[`, character(1), 2))
   )
-  c(bytes, ops, mountstats_read_times(block), proc_faults())
+  c(bytes, ops, mountstats_read_times(block), proc_faults(), cgroup_stats())
+}
+
+# cgroup v2 counters of this process's cgroup (the container's in a pod):
+# cpu.stat (usage, nr_throttled, throttled_usec, ...), all of memory.stat
+# (gauges such as file/anon too; their deltas are still informative) and PSI
+# "total=" microseconds from cpu/memory/io.pressure.
+cgroup_stats <- function() {
+  if (!file.exists("/proc/self/cgroup")) return(NULL)
+  rel <- sub("^0::", "", grep("^0::", readLines("/proc/self/cgroup"), value = TRUE)[1])
+  root <- file.path("/sys/fs/cgroup", sub("^/", "", rel))
+  kv <- function(name, prefix) {
+    f <- file.path(root, name)
+    if (!file.exists(f)) return(NULL)
+    s <- strsplit(readLines(f, warn = FALSE), " ")
+    v <- suppressWarnings(as.numeric(vapply(s, `[`, "", 2)))
+    stats::setNames(v, paste0(prefix, vapply(s, `[`, "", 1)))[!is.na(v)]
+  }
+  psi <- function(res) {
+    f <- file.path(root, paste0(res, ".pressure"))
+    if (!file.exists(f)) return(NULL)
+    l <- readLines(f, warn = FALSE)
+    stats::setNames(as.numeric(sub(".*total=", "", l)),
+      paste0("cg_psi_", res, "_", sub(" .*", "", l), "_us"))
+  }
+  c(kv("cpu.stat", "cg_cpu_"), kv("memory.stat", "cg_mem_"),
+    psi("cpu"), psi("memory"), psi("io"))
 }
 
 # Cumulative READ queue/rtt/execute milliseconds from the per-op line
