@@ -224,7 +224,28 @@ mountstats_snapshot <- function() {
     vapply(ops, function(m) as.numeric(m[[3]]), numeric(1)),
     paste0("ops_", vapply(ops, `[[`, character(1), 2))
   )
-  c(bytes, ops)
+  c(bytes, ops, mountstats_read_times(block), proc_faults())
+}
+
+# Cumulative READ queue/rtt/execute milliseconds from the per-op line
+# "READ: ops trans timeouts bytes_sent bytes_recv queue rtt execute [errors]"
+mountstats_read_times <- function(block) {
+  line <- grep("^\\s+READ:", block, value = TRUE)[1]
+  if (is.na(line)) return(NULL)
+  f <- as.numeric(strsplit(trimws(sub("^\\s+READ:", "", line)), "\\s+")[[1]])
+  if (length(f) < 8) return(NULL)
+  stats::setNames(f[6:8], c("read_queue_ms", "read_rtt_ms", "read_exec_ms"))
+}
+
+# Page faults of this R process and its waited-for children (/proc/self/stat
+# fields 10-13). Parsed after the last ")" since comm may contain spaces.
+proc_faults <- function() {
+  if (!file.exists("/proc/self/stat")) return(NULL)
+  stat <- readLines("/proc/self/stat", warn = FALSE)
+  f <- strsplit(trimws(sub("^.*\\)", "", stat)), "\\s+")[[1]]
+  # f[1] is field 3 (state), so field n is f[n - 2]
+  stats::setNames(as.numeric(f[8:11]),
+    c("proc_minflt", "proc_cminflt", "proc_majflt", "proc_cmajflt"))
 }
 
 mountstats_record <- function(name, before, purge_time) {
