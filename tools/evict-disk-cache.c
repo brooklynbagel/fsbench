@@ -6,9 +6,20 @@
 //   DIR defaults to $TARGET_DIR. Steps, in order:
 //   1. sync(), then posix_fadvise(POSIX_FADV_DONTNEED) on every regular file
 //      under DIR (page cache). Residency before/after is measured with mincore.
-//   2. -D disables: create+unlink a dummy entry in every directory under DIR,
-//      after step 1, so the directory's change attribute moves and cached NFS
-//      lookups (incl. those the walk itself just made) must be revalidated.
+//   2. -D disables: NFS metadata invalidation, so later opens cost what they
+//      do after drop_caches (LOOKUP + OPEN + CLOSE per file on NFSv4):
+//      a. after each file's fadvise, chmod it to its current mode (utimensat
+//         to "now" if the caller isn't the owner). The SETATTR makes the
+//         client return its read delegation, which otherwise lets it open
+//         locally and trust the cached dentry.
+//      b. after a directory's contents (FTW_DEPTH), chmod the directory to its
+//         current mode. The SETATTR's change attribute isn't reported as
+//         atomic, so the client invalidates the directory's child dentries
+//         and the next stat/open does a LOOKUP. (Create/unlink of a dummy
+//         entry doesn't work: the server reports those as atomic.) Must run
+//         after (a): dentries of inodes with a delegation are trusted anyway.
+//      Changes ctime only; modes and mtimes are kept (unless the utimensat
+//      fallback is used). Verified with scratch/k8s/lookup-probe.sh.
 //   3. -n disables: memory squeeze. Allocate anonymous memory until the
 //      cgroup's reclaimable file pages are gone or only a safety margin (-m,
 //      default max(128 MiB, limit/32)) is left, then free it. Skipped if the
@@ -52,7 +63,7 @@ static long long opt_margin_mib = -1;
 static long page_size;
 
 static struct {
-  uint64_t files, file_errs, dirs, dir_errs;
+  uint64_t files, file_errs, meta_files, dirs, dir_errs;
   uint64_t bytes, resident_before, resident_after;
 } st;
 
@@ -80,6 +91,14 @@ static int64_t resident_bytes(int fd, off_t size) {
   return n;
 }
 
+// Same-mode chmod (a no-op except for ctime) to force an NFS SETATTR; falls
+// back to setting the times to now when the caller doesn't own the entry.
+static int touch_meta(const char *path, mode_t mode) {
+  if (chmod(path, mode & 07777) == 0) return 0;
+  if (errno != EPERM) return -1;
+  return utimensat(AT_FDCWD, path, NULL, 0);
+}
+
 static int visit(const char *path, const struct stat *sb, int type,
                  struct FTW *ftw) {
   (void)ftw;
@@ -96,17 +115,13 @@ static int visit(const char *path, const struct stat *sb, int type,
       if (r > 0) st.resident_after += r;
     }
     close(fd);
+    // after close, so returning the delegation doesn't need to recover open state
+    if (!opt_report && opt_dirtouch) {
+      if (touch_meta(path, sb->st_mode) == 0) st.meta_files++; else st.file_errs++;
+    }
   } else if (type == FTW_DP && !opt_report && opt_dirtouch) {
     // FTW_DEPTH: directories are visited after their contents.
-    char name[4096];
-    int n = snprintf(name, sizeof name, "%s/.fsbench-evict-%ld", path,
-                     (long)getpid());
-    int fd = (n > 0 && (size_t)n < sizeof name)
-               ? open(name, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600)
-               : -1;
-    if (fd == -1) { st.dir_errs++; return 0; }
-    close(fd);
-    if (unlink(name) == 0) st.dirs++; else st.dir_errs++;
+    if (touch_meta(path, sb->st_mode) == 0) st.dirs++; else st.dir_errs++;
   } else if (type == FTW_DNR || type == FTW_NS) {
     st.file_errs++;
   }
@@ -274,10 +289,11 @@ int main(int argc, char **argv) {
     else
       fprintf(stderr,
               "evict-disk-cache: %llu files (%.1f MiB), resident %.1f -> %.1f MiB, "
-              "%llu dirs touched, %llu file / %llu dir errors, "
+              "%llu files / %llu dirs touched, %llu file / %llu dir errors, "
               "walk %.2f s, squeeze %.2f s\n",
               (unsigned long long)st.files, st.bytes / MiB,
               st.resident_before / MiB, st.resident_after / MiB,
+              (unsigned long long)st.meta_files,
               (unsigned long long)st.dirs, (unsigned long long)st.file_errs,
               (unsigned long long)st.dir_errs, t1 - t0, t2 - t1);
   }
